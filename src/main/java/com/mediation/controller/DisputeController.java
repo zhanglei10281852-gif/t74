@@ -1,13 +1,20 @@
 package com.mediation.controller;
 
 import com.mediation.dto.DisputeDTO;
+import com.mediation.dto.PreventiveInterventionDTO;
 import com.mediation.entity.Dispute;
+import com.mediation.entity.Dispute.DisputeSource;
 import com.mediation.entity.Dispute.DisputeStatus;
 import com.mediation.entity.Dispute.DisputeType;
+import com.mediation.entity.DisputeClue;
 import com.mediation.entity.Mediator;
 import com.mediation.entity.Mediator.MediatorStatus;
+import com.mediation.entity.RiskWarning;
+import com.mediation.entity.RiskWarning.WarningStatus;
+import com.mediation.repository.DisputeClueRepository;
 import com.mediation.repository.DisputeRepository;
 import com.mediation.repository.MediatorRepository;
+import com.mediation.repository.RiskWarningRepository;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -29,6 +36,8 @@ public class DisputeController {
 
     private final DisputeRepository disputeRepository;
     private final MediatorRepository mediatorRepository;
+    private final RiskWarningRepository riskWarningRepository;
+    private final DisputeClueRepository disputeClueRepository;
 
     @PostMapping
     public ResponseEntity<?> create(@Valid @RequestBody DisputeDTO dto) {
@@ -51,10 +60,74 @@ public class DisputeController {
                 .respondentPhone(dto.getRespondentPhone())
                 .description(dto.getDescription())
                 .amount(dto.getAmount())
+                .source(DisputeSource.当事人申请)
                 .build();
 
         Dispute saved = disputeRepository.save(dispute);
         return ResponseEntity.status(HttpStatus.CREATED).body(saved);
+    }
+
+    @PostMapping("/preventive-intervention")
+    @org.springframework.transaction.annotation.Transactional
+    public ResponseEntity<?> createPreventiveIntervention(@Valid @RequestBody PreventiveInterventionDTO dto) {
+        Optional<RiskWarning> warningOpt = riskWarningRepository.findById(dto.getWarningId());
+        if (warningOpt.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "预警不存在"));
+        }
+
+        RiskWarning warning = warningOpt.get();
+        if (warning.getStatus() != WarningStatus.已介入) {
+            return ResponseEntity.badRequest().body(Map.of("error", "只有已介入状态的预警才能发起预防性调解"));
+        }
+
+        Optional<DisputeClue> clueOpt = disputeClueRepository.findById(warning.getClueId());
+
+        String applicantIdCard = dto.getApplicantIdCard();
+        if (applicantIdCard == null || applicantIdCard.isBlank()) {
+            applicantIdCard = "000000000000000000";
+        }
+
+        String caseNo = generateCaseNo();
+
+        Dispute dispute = Dispute.builder()
+                .caseNo(caseNo)
+                .disputeType(clueOpt.map(DisputeClue::getDisputeType).orElse(DisputeType.其他))
+                .applicantName(dto.getApplicantName())
+                .applicantPhone(dto.getApplicantPhone() != null ? dto.getApplicantPhone() : "")
+                .applicantIdCard(applicantIdCard)
+                .respondentName(dto.getRespondentName() != null ? dto.getRespondentName() : "")
+                .respondentPhone(dto.getRespondentPhone())
+                .description(dto.getDescription() != null ? dto.getDescription() :
+                        (clueOpt.map(DisputeClue::getDescription).orElse("预防性调解案件")))
+                .amount(dto.getAmount() != null ? dto.getAmount() : clueOpt.map(DisputeClue::getInvolvedAmount).orElse(null))
+                .source(DisputeSource.排查发现)
+                .warningId(warning.getId())
+                .clueId(warning.getClueId())
+                .mediatorId(warning.getMediatorId())
+                .status(DisputeStatus.调解中)
+                .build();
+
+        if (warning.getMediatorId() != null) {
+            Optional<Mediator> mediatorOpt = mediatorRepository.findById(warning.getMediatorId());
+            mediatorOpt.ifPresent(mediator -> {
+                mediator.setCaseCount(mediator.getCaseCount() + 1);
+                mediatorRepository.save(mediator);
+            });
+        }
+
+        Dispute savedDispute = disputeRepository.save(dispute);
+
+        warning.setDisputeId(savedDispute.getId());
+        riskWarningRepository.save(warning);
+
+        if (clueOpt.isPresent()) {
+            DisputeClue clue = clueOpt.get();
+            clue.setHasDispute(true);
+            clue.setDisputeId(savedDispute.getId());
+            disputeClueRepository.save(clue);
+        }
+
+        return ResponseEntity.status(HttpStatus.CREATED).body(savedDispute);
     }
 
     @GetMapping
@@ -63,7 +136,8 @@ public class DisputeController {
             @RequestParam(defaultValue = "10") int size,
             @RequestParam(required = false) String status,
             @RequestParam(required = false) String disputeType,
-            @RequestParam(required = false) Long mediatorId) {
+            @RequestParam(required = false) Long mediatorId,
+            @RequestParam(required = false) String source) {
 
         Pageable pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
 
@@ -77,6 +151,9 @@ public class DisputeController {
             result = disputeRepository.findByDisputeType(dt, pageable);
         } else if (mediatorId != null) {
             result = disputeRepository.findByMediatorId(mediatorId, pageable);
+        } else if (source != null) {
+            DisputeSource ds = DisputeSource.valueOf(source);
+            result = disputeRepository.findBySource(ds, pageable);
         } else {
             result = disputeRepository.findAll(pageable);
         }
@@ -104,6 +181,9 @@ public class DisputeController {
         response.put("description", dispute.getDescription());
         response.put("amount", dispute.getAmount());
         response.put("mediatorId", dispute.getMediatorId());
+        response.put("source", dispute.getSource());
+        response.put("warningId", dispute.getWarningId());
+        response.put("clueId", dispute.getClueId());
         response.put("status", dispute.getStatus());
         response.put("result", dispute.getResult());
         response.put("createdAt", dispute.getCreatedAt());
@@ -112,6 +192,16 @@ public class DisputeController {
         if (dispute.getMediatorId() != null) {
             mediatorRepository.findById(dispute.getMediatorId())
                     .ifPresent(mediator -> response.put("mediatorName", mediator.getName()));
+        }
+
+        if (dispute.getWarningId() != null) {
+            riskWarningRepository.findById(dispute.getWarningId())
+                    .ifPresent(warning -> response.put("warning", warning));
+        }
+
+        if (dispute.getClueId() != null) {
+            disputeClueRepository.findById(dispute.getClueId())
+                    .ifPresent(clue -> response.put("clue", clue));
         }
 
         return ResponseEntity.ok(response);
@@ -176,6 +266,7 @@ public class DisputeController {
     }
 
     @PutMapping("/{id}/close")
+    @org.springframework.transaction.annotation.Transactional
     public ResponseEntity<?> close(@PathVariable Long id, @RequestBody Map<String, Object> body) {
         String result = (String) body.get("result");
         Boolean success = (Boolean) body.get("success");
@@ -199,6 +290,17 @@ public class DisputeController {
         dispute.setResult(result);
         dispute.setStatus(success ? DisputeStatus.调解成功 : DisputeStatus.调解失败);
         disputeRepository.save(dispute);
+
+        if (dispute.getWarningId() != null && (dispute.getStatus() == DisputeStatus.调解成功 || dispute.getStatus() == DisputeStatus.已撤回)) {
+            Optional<RiskWarning> warningOpt = riskWarningRepository.findById(dispute.getWarningId());
+            if (warningOpt.isPresent() && warningOpt.get().getStatus() == WarningStatus.已介入) {
+                RiskWarning warning = warningOpt.get();
+                warning.setStatus(WarningStatus.已化解);
+                warning.setResolvedAt(java.time.LocalDateTime.now());
+                warning.setRemark(result);
+                riskWarningRepository.save(warning);
+            }
+        }
 
         return ResponseEntity.ok(dispute);
     }
@@ -240,6 +342,12 @@ public class DisputeController {
             byType.put(type.name(), disputeRepository.countByDisputeType(type));
         }
         stats.put("byType", byType);
+
+        Map<String, Long> bySource = new LinkedHashMap<>();
+        for (DisputeSource source : DisputeSource.values()) {
+            bySource.put(source.name(), disputeRepository.countBySource(source));
+        }
+        stats.put("bySource", bySource);
 
         return ResponseEntity.ok(stats);
     }

@@ -51,6 +51,16 @@ public class Dispute {
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
+    private DisputeSource source;
+
+    @Column(name = "warning_id")
+    private Long warningId;
+
+    @Column(name = "clue_id")
+    private Long clueId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
     private DisputeStatus status;
 
     @Column(columnDefinition = "TEXT")
@@ -69,6 +79,9 @@ public class Dispute {
         if (this.status == null) {
             this.status = DisputeStatus.待受理;
         }
+        if (this.source == null) {
+            this.source = DisputeSource.当事人申请;
+        }
     }
 
     @PreUpdate
@@ -82,5 +95,9 @@ public class Dispute {
 
     public enum DisputeStatus {
         待受理, 已受理, 调解中, 调解成功, 调解失败, 已撤回
+    }
+
+    public enum DisputeSource {
+        当事人申请, 排查发现
     }
 }
